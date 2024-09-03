@@ -261,6 +261,44 @@ class TorchDevice:
 
         data = token_embed + pos_embed
         return TorchTensor.create_from_torch(data, self)
+    def llama_rms_norm(self, hidden, eps, weight, donate):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+        
+    def llama_input_embed(self, inputs, attention_mask, w_token, pad_token_id, donate, rope_theta, head_dim):
+        # decompress weights
+        if w_token.device.device_type == DeviceType.COMPRESSED:
+            w_token = w_token.device.decompress(w_token)
+
+        token_ids = inputs.data
+        mask = attention_mask.data
+        if donate[0]: inputs.delete()
+        if donate[1]: attention_mask.delete()
+
+        # token embedding
+        token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
+        
+        # cut positions if `past_key_values_length` is > 0
+        past_key_values_length = mask.shape[1] - token_ids.shape[1]
+        cache_position = torch.arange(past_key_values_length, past_key_values_length + token_ids.shape[1], device = inputs.device)
+        position_ids = cache_position.unsquees(0)
+
+        base = rope_theta
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float().to(inputs.device) / head_dim))
+        
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        device_type = inputs.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+        
+        return TorchTensor.create_from_torch(token_embed, self), TorchTensor.create_from_torch(cos, self), TorchTensor.create_from_torch(sin, self)
 
     def opt_output_embed(self, inputs, w_ln, b_ln, w_token, donate,
                          do_sample, temperature):
@@ -578,6 +616,24 @@ class TorchDevice:
         out = F.linear(out, wi.data, bias=bi.data)
         F.relu(out, inplace=True)
         out = F.linear(out, wo.data, bias=bo.data)
+
+        out.add_(inputs.data)
+        if donate[0]: inputs.delete()
+        return TorchTensor.create_from_torch(out, self)
+    
+    def mlp3way(self, inputs, w_gate, w_up, w_down, w_ln, donate):
+        # decompress weights
+        if w_gate.device.device_type == DeviceType.COMPRESSED:
+            w_gate = w_gate.device.decompress(w_gate)
+            w_up = w_up.device.decompress(w_up)
+            w_down = w_up.device.decompress(w_down)
+
+        b, s, h = inputs.shape
+
+        out = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        out = F.linear(out, w_up.data)
+        F.relu(out, inplace=True)
+        out = F.linear(out, wo.data)
 
         out.add_(inputs.data)
         if donate[0]: inputs.delete()
