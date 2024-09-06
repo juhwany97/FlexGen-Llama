@@ -113,9 +113,14 @@ def init_weight_list(weight_specs, policy, env):
             weight = home.allocate(shape, dtype, pin_memory=pin_memory)
 
             if DUMMY_WEIGHT not in filename:
+                import pdb; pdb.set_trace()
                 weight.load_from_np_file(weight_specs[i][2])
             else:
-                weight.load_from_np(np.ones(shape, dtype))
+                if type(dtype) != torch.dtype:
+                    weight.load_from_np(np.ones(shape, dtype))
+                else:
+                    # import pdb; pdb.set_trace()
+                    weight.load_from_torch(torch.ones(shape, dtype = dtype))
                 #weight.load_from_np(np.random.rand(*shape).astype(dtype))
         else:
             weight = home.compressed_device.allocate(
@@ -195,7 +200,7 @@ class InputEmbed:
             w_token, w_pos, self.config.pad_token_id, donate)
         hidden.val = h
 
-class LlamaRotaryInputEmbed:
+class LlamaRotaryEmbedding:
     def __init__(self, config, env, policy):
         self.config = config
         self.env = env
@@ -223,7 +228,7 @@ class LlamaRotaryInputEmbed:
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_token = weight_home.val
+        w_token = weight_home.val[0]
         if k == 0:
             dst = self.weight_load_dst
             weight_read_buf.store(w_token.smart_copy(dst))
@@ -240,12 +245,16 @@ class LlamaRotaryInputEmbed:
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len), np.int64
 
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+    def forward(self, hidden, position_embeddings, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
         # Compute input embedding
         donate = [False] * 4
         h, donate[0] = hidden.val, True
-        mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+
+        try:
+            mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+        except:
+            import pdb; pdb.set_trace()
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
@@ -254,10 +263,12 @@ class LlamaRotaryInputEmbed:
             (w_token, _) = weight_read_buf.val
 
         h, cos, sin = self.compute.llama_input_embed(h, mask,
-            w_token, self.config.pad_token_id, donate, self.config.rope_theta, self.config.hidden_size // self.config.num_heads)
+            w_token, self.config.pad_token_id, donate, self.config.rope_theta, self.config.hidden_size // self.config.n_head)
         
         hidden.val = h
-        positional_embedding = cos, sin
+        # position_embeddings = (cos, sin)
+        position_embeddings[0] = cos
+        position_embeddings[1] = sin
 
 
 class OutputEmbed:
@@ -322,6 +333,65 @@ class OutputEmbed:
             (w_ln, _), (b_ln, _), (w_token, _) = weight_read_buf.val
 
         h = self.compute.opt_output_embed(h, w_ln, b_ln, w_token, donate,
+            self.task.do_sample, self.task.temperature)
+        hidden.val = h
+
+class LlamaLMHead:
+    def __init__(self, config, env, policy):
+        self.config = config
+        self.env = env
+        self.policy = policy
+        self.compute = self.env.gpu
+        self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
+            else self.compute)
+
+        self.task = None
+
+    def set_task(self, task):
+        self.task = task
+
+    def init_weight(self, weight_home, path):
+        v, h, dtype = (self.config.vocab_size, self.config.input_dim,
+            self.config.dtype)
+        path = os.path.join(path, "")
+        weight_specs = [
+            ((v, h), dtype, path + "lm_head.weight"),
+        ]
+        weights = init_weight_list(weight_specs, self.policy, self.env)
+
+        weight_home.store(weights)
+
+    def load_weight(self, weight_home, weight_read_buf, k):
+        w_lm_head = weight_home.val[0]
+        if k == 0:
+            dst1 = self.weight_load_dst
+            dst2 = self.compute
+            weight_read_buf.store((w_lm_head.smart_copy(dst1)))
+
+    def init_cache_one_gpu_batch(self, cache_home):
+        pass  # do nothing
+
+    def load_cache(self, cache_home, cache_read_buf, i):
+        pass  # do nothing
+
+    def store_cache(self, cache_home, cache_write_buf, i):
+        pass  # do nothing
+
+    def input_act_shape_and_dtype(self, batch_size, seq_len):
+        return (batch_size, seq_len, self.config.input_dim), self.config.dtype
+
+    def forward(self, hidden, position_embeddings, cache_read_buf, weight_read_buf, attention_mask,
+                cache_write_buf, i, k):
+        donate = [False] * 2
+        h, donate[0] = hidden.val, True
+
+        if k == self.policy.num_gpu_batches - 1:
+            # Clear the weight_read_buf if it is the last gpu batch
+            (w_lm_head, donate[1]) = weight_read_buf.pop()
+        else:
+            (w_lm_head, _)= weight_read_buf.val
+
+        h = self.compute.llama_lm_head(h, w_lm_head, donate,
             self.task.do_sample, self.task.temperature)
         hidden.val = h
 
@@ -542,43 +612,31 @@ class LlamaGroupedQueryAttention:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
-        path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}.self_attn"))
+        n_head, n_kv_head = (self.config.n_head, self.config.n_kv_head)
+        grp_size = n_head // n_kv_head
+        w_kv_dim = h // grp_size
+        
+        path = os.path.join(os.path.join(path, f"layers.{self.layer_id}.self_attn"))
         weight_specs = [
             # w_q
             ((h, h), dtype, path + ".q_proj.weight"),
-            # b_q
-            ((h,), dtype, path + ".q_proj.bias"),
             # w_k
-            ((h, h), dtype, path + ".k_proj.weight"),
-            # b_k
-            ((h,), dtype, path + ".k_proj.bias"),
+            ((w_kv_dim, h), dtype, path + ".k_proj.weight"),
             # w_v
-            ((h, h), dtype, path + ".v_proj.weight"),
-            # b_v
-            ((h,), dtype, path + ".v_proj.bias"),
+            ((w_kv_dim, h), dtype, path + ".v_proj.weight"),
             # w_out
             ((h, h), dtype, path + ".out_proj.weight"),
-            # b_out
-            ((h,), dtype, path + ".out_proj.bias"),
-            # w_ln
-            ((h,), dtype, path + "_layer_norm.weight"),
-            # b_ln
-            ((h,), dtype, path + "_layer_norm.bias"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
+        w_q, w_k, w_v, w_out = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
             weight_read_buf.store((
-                w_q.smart_copy(dst1), b_q.smart_copy(dst2),
-                w_k.smart_copy(dst1), b_k.smart_copy(dst2),
-                w_v.smart_copy(dst1), b_v.smart_copy(dst2),
-                w_out.smart_copy(dst1), b_out.smart_copy(dst2),
-                w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
+                w_q.smart_copy(dst1),w_k.smart_copy(dst1), w_v.smart_copy(dst1), w_out.smart_copy(dst1)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -686,35 +744,32 @@ class LlamaGroupedQueryAttention:
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+    def forward(self, hidden, position_embeddings, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
         n_head = self.config.n_head
+        n_kv_head = self.config.n_kv_head
+        attn_dropout = self.config.attention_dropout
 
-        donate = [False] * 14
+        donate = [False] * 8
         h, donate[0] = hidden.val, True
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            ((w_q, donate[2]), (b_q, donate[3]), (w_k, donate[4]), (b_k, donate[5]),
-             (w_v, donate[6]), (b_v, donate[7]), (w_out, donate[8]), (b_out, donate[9]),
-             (w_ln, donate[10]), (b_ln, donate[11])) = weight_read_buf.pop()
+            ((w_q, donate[2]), (w_k, donate[3]),
+             (w_v, donate[4]), (w_out, donate[5])) = weight_read_buf.pop()
         else:
-            ((w_q, _), (b_q, _), (w_k, _), (b_k, _),
-             (w_v, _), (b_v, _), (w_out, _), (b_out, _),
-             (w_ln, _), (b_ln, _)) = weight_read_buf.val
+            ((w_q, _),(w_k, _),(w_v, _),(w_out, _)) = weight_read_buf.val
 
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
-                w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
+            h, new_k_cache, new_v_cache = self.compute.gqa(h, mask, position_embeddings, attn_dropout, w_q, w_k, w_v, w_out, n_head, n_kv_head, donate,
                 self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-            (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
-            h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
-                b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
-                k_cache, v_cache, donate, self.policy.attn_sparsity,
+            (k_cache, donate[6]), (v_cache, donate[7]) = cache_read_buf.pop()
+            h, new_k_cache, new_v_cache = self.compute.gqa_gen(h, mask, position_embeddings, attn_dropout, w_q,
+                w_k, w_v, w_out, n_head, n_kv_head, k_cache, v_cache, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
@@ -754,10 +809,12 @@ class LlamaRMSNorm(torch.nn.Module):
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
         
-    def forward(self, hidden_states, cache_read_buf, weight_read_buf, attention_mask,
+    def forward(self, hidden_states, position_embeddings, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
+        h = hidden_states.val
         h = self.compute.llama_rms_norm(h, self.variance_epsilon, self.weight)
         hidden_states.val = h
+        return h
         
 
 class MLP:
@@ -853,26 +910,24 @@ class Llama3wayMLP:
         h, ffn_dim, dtype = (self.config.input_dim, self.config.ffn_embed_dim, self.config.dtype)
         path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}."))
         weight_specs = [
-            # w_ln
-            ((h,), dtype, path + "post_attention_layernorm.weight"),
             # w_gate
-            ((h, ffn_dim), dtype, path + "gate_proj.weight"),
+            ((ffn_dim, h), dtype, path + "gate_proj.weight"),
             # w_up
-            ((h, ffn_dim), dtype, path + "up_proj.weight"),
+            ((ffn_dim, h), dtype, path + "up_proj.weight"),
             # w_down
-            ((ffn_dim, h), dtype, path + "down_proj.weight"),
+            ((h, ffn_dim), dtype, path + "down_proj.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_ln, w_gate, w_up, w_down = weight_home.val
+        w_gate, w_up, w_down = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
             weight_read_buf.store((
                 w_gate.smart_copy(dst1), w_up.smart_copy(dst1),
-                w_down.smart_copy(dst1), w_ln.smart_copy(dst2)))
+                w_down.smart_copy(dst1)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -886,18 +941,18 @@ class Llama3wayMLP:
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+    def forward(self, hidden, position_embeddings, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
-        donate = [False] * 5
+        donate = [False] * 4
         h, donate[0] = hidden.val, True
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            ((w_ln, donate[1]), (w_gate, donate[2]), (w_up, donate[3]), (w_down, donate[4])) = weight_read_buf.pop()
+            ((w_gate, donate[1]), (w_up, donate[2]), (w_down, donate[3])) = weight_read_buf.pop()
         else:
-            ((w_ln, _), (w_gate, _), (w_up, _), (w_down, _)) = weight_read_buf.val
-        h = self.post_attetion_layernorm.forward(hidden,cache_read_buf, weight_read_buf, attention_mask, cache_read_buf, i, k)
-        h = self.compute.mlp3way(h, w_gate, w_up, w_down, w_ln, donate)
+            ((w_gate, _), (w_up, _), (w_down, _)) = weight_read_buf.val
+        h = self.post_attetion_layernorm.forward(hidden, position_embeddings, cache_read_buf, weight_read_buf, attention_mask, cache_read_buf, i, k)
+        h = self.compute.mlp3way(h, w_gate, w_up, w_down, donate)
         hidden.val = h
 
 
@@ -1523,22 +1578,24 @@ class LlamaLM:
                  path: str,
                  policy: Policy):
         if isinstance(config, str):
-            config = get_opt_config(config)
+            config = get_llama_config(config)
         self.config = config
         self.env = env
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
+        self.position_embeddings = [[0, 0] for i in range(self.num_gpu_batches)]
+        
+        self.causal_mask = torch.full((config.max_seq_len,config.max_seq_len), fill_value = 1)
 
         layers = []
-        layers.append(LlamaRotaryInputEmbed(self.config, self.env, self.policy))
+        layers.append(LlamaRotaryEmbedding(self.config, self.env, self.policy))
         for i in range(self.config.num_hidden_layers):
-            if policy.sep_layer:
-                layers.append(LlamaGroupedQueryAttention(self.config, self.env, self.policy, i))
-                layers.append(Llama3wayMLP(self.config, self.env, self.policy, i))
-            else:
-                layers.append(TransformerLayer(self.config, self.env, self.policy, i))
-        layers.append(OutputEmbed(self.config, self.env, self.policy))
+            layers.append(LlamaGroupedQueryAttention(self.config, self.env, self.policy, i))
+            # layers.append(MLP(self.config, self.env, self.policy, i))
+            layers.append(Llama3wayMLP(self.config, self.env, self.policy, i))
+            #layers.append(TransformerLayer(self.config, self.env, self.policy, i))
+        layers.append(LlamaLMHead(self.config, self.env, self.policy))
         self.layers = layers
         self.num_layers = len(layers)
 
@@ -1704,6 +1761,7 @@ class LlamaLM:
         if j == self.num_layers - 1:  # store to output
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
+            #import pdb; pdb.set_trace()
             ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
             pos = self.task.prompt_len + i
             if self.task.stop:
@@ -1723,7 +1781,8 @@ class LlamaLM:
         # Clear the weight_read_buf if it is the last gpu batch
         # Clear the cache_read_buf
         # Run layer computation
-        self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
+
+        self.layers[j].forward(self.hidden[i][j][k], self.position_embeddings[k], self.cache_read_buf[j][k],
             self.weight_read_buf[j], self.attention_mask[k],
             self.cache_write_buf[j][k], i, k)
 
@@ -1741,6 +1800,7 @@ class LlamaLM:
             self.delete_weight(j, 0)
 
     def update_attention_mask(self, i, k):
+        min_dtype = torch.finfo(self.config.dtype).min
         if i > 0:
             mask = self.attention_mask[k]
             assert mask.val is not None
@@ -1754,9 +1814,24 @@ class LlamaLM:
 
         attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
             else self.env.gpu)
+        # val = attention_compute.allocate(
+        #     (self.policy.gpu_batch_size, self.task.prompt_len), self.config.dtype)
         val = attention_compute.allocate(
-            (self.policy.gpu_batch_size, self.task.prompt_len), bool)
-        val.load_from_np((input_ids != self.config.pad_token_id))
+            (self.policy.gpu_batch_size, self.config.n_head, self.task.prompt_len, self.task.prompt_len), self.config.dtype)
+        # self.attention_mask[k] = torch.ones(self.policy.gpu_batch_size, self.task.prompt_len, dtype = self.config.dtype)
+        val_tensor = torch.from_numpy(input_ids != self.config.pad_token_id).long()
+        
+        cache_position = torch.arange(
+                0, self.task.prompt_len,  device=attention_compute.dev
+            )
+        causal_mask = torch.full((self.task.prompt_len, self.task.prompt_len), fill_value=min_dtype, dtype=self.config.dtype, device=attention_compute.dev)
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        causal_mask *= torch.arange(self.task.prompt_len, device=attention_compute.dev) > cache_position.reshape(-1, 1)
+        causal_mask = causal_mask[None, None, :, :].expand(gpu_batch_size, 1, -1, -1)
+        
+        # import pdb; pdb.set_trace()
+        
+        val.load_from_torch(causal_mask)
         self.attention_mask[k].store(val)
 
     def generate(self,
@@ -2114,12 +2189,12 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
 
 
 def run_flexgen(args):
-    print(f"<run_flexgen>: args.model: {args.model}")
+    print(f"<run_flexgen>: args.model: {args.model.lower()}")
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
-    elif args.model == "meta-llama/llama-3-8b":
+    elif args.model.lower() == "meta-llama/llama-3-8b":
         tokenizer = AutoTokenizer.from_pretrained("meta-llama/llama-3-8b", padding_side="left")
-    elif args.model == "meta-llama/llama-3-70b":
+    elif args.model.lower() == "meta-llama/llama-3-70b":
         tokenizer = AutoTokenizer.from_pretrained("meta-llama/llama-3-70b", padding_side="left")
     else:
         tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
@@ -2130,7 +2205,7 @@ def run_flexgen(args):
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
     inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
-    gpu = TorchDevice("cuda:0")
+    gpu = TorchDevice("cuda:1")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -2150,7 +2225,7 @@ def run_flexgen(args):
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
     
     model = None
-    if args.model == "meta-llama/llama-3-70b":
+    if args.model.lower() == "meta-llama/meta-llama-3-70b":
         llama_config = get_llama_config(args.model)
         cache_size = llama_config.cache_bytes(num_prompts, prompt_len + gen_len)
         hidden_size = llama_config.hidden_bytes(num_prompts, prompt_len + gen_len)
@@ -2159,7 +2234,17 @@ def run_flexgen(args):
             f"hidden size (prefill): {hidden_size/GB:.3f} GB")
 
         print("init weight...")
-        model = LlamaLM(opt_config, env, args.path, policy)
+        model = LlamaLM(llama_config, env, args.path, policy)
+    if args.model.lower() == "meta-llama/meta-llama-3-8b":
+        llama_config = get_llama_config(args.model)
+        cache_size = llama_config.cache_bytes(num_prompts, prompt_len + gen_len)
+        hidden_size = llama_config.hidden_bytes(num_prompts, prompt_len + gen_len)
+        print(f"model size: {llama_config.model_bytes()/GB:.3f} GB, "
+            f"cache size: {cache_size/GB:.3f} GB, "
+            f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+
+        print("init weight...")
+        model = LlamaLM(llama_config, env, args.path, policy)
     else:
         opt_config = get_opt_config(args.model)
         cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)

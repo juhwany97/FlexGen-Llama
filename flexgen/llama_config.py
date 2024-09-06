@@ -9,7 +9,7 @@ import dataclasses
 import glob
 import os
 import shutil
-
+import torch
 import numpy as np
 from tqdm import tqdm
 
@@ -29,8 +29,9 @@ class LlamaConfig:
     vocab_size: int = 128256
     rope_theta: int = 500000
     layer_norm_eps: float = 0.00001
+    attention_dropout: float = 0.0
     pad_token_id: int = 1
-    dtype: type = np.float16
+    dtype: torch.dtype = torch.bfloat16
 
     def model_bytes(self):
         h = self.input_dim
@@ -45,16 +46,16 @@ class LlamaConfig:
         # mlp (3-way)
         3 * h * ffn_dim +
         # layer norm
-        h * 4) +
-        # embedding
-        self.vocab_size * h)
+        h * 2) +
+        # embedding (embed + lm_head)
+        self.vocab_size * h * 2) 
 
 
     def cache_bytes(self, batch_size, seq_len):
-        return 2 * batch_size * seq_len * self.num_hidden_layers * (self.input_dim * self.n_head) // self.n_kv_head * self.dtype.nbytes 
+        return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * (self.n_kv_head / self.n_head) * 2 # FP16
 
     def hidden_bytes(self, batch_size, seq_len):
-        return batch_size * seq_len * self.input_dim * self.dtype.nbytes
+        return batch_size * seq_len * self.input_dim * 2 # FP16
 
 
 def get_llama_config(name, **kwargs):
