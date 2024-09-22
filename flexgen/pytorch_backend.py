@@ -179,7 +179,10 @@ class TorchTensor:
         if dst.device_type == DeviceType.COMPRESSED:
             ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype], self.data[2])
         else:
-            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype])
+            if self.dtype == torch.bfloat16:
+                ret = dst.allocate(shape, self.dtype)
+            else:
+                ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype])
         general_copy(ret, None, self, src_indices)
         return ret
 
@@ -230,7 +233,6 @@ class TorchDevice:
             pin_memory = True if pin_memory is None else pin_memory
         else:
             pin_memory = False
-        # import pdb; pdb.set_trace()
         if type(dtype) != torch.dtype:
             dtype = np_dtype_to_torch_dtype[dtype]
         data = torch.empty(shape, dtype=dtype, pin_memory=pin_memory, device=self.dev)
@@ -358,6 +360,9 @@ class TorchDevice:
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
+            
+            cos = cos.to(dtype=inputs.dtype)
+            sin = sin.to(dtype=inputs.dtype)
         
         return TorchTensor.create_from_torch(token_embed, self), TorchTensor.create_from_torch(cos, self), TorchTensor.create_from_torch(sin, self)
 
@@ -512,8 +517,6 @@ class TorchDevice:
         k = k.view(b, tgt_s, n_head, head_dim)
         v = v.view(b, tgt_s, n_head, head_dim)
 
-        import pdb; pdb.set_trace()
-
         # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
         # shape: (1, b * n_head, head_dim)
@@ -543,6 +546,7 @@ class TorchDevice:
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, n_head, head_dim)
                 else:
+                    import pdb; pdb.set_trace()
                     q = q.float().cpu()
                     k, v = k.float(), v.float()
                     value = self._attention_value(q, k, v, attention_mask.data,
@@ -629,7 +633,6 @@ class TorchDevice:
         attn_weights = torch.matmul(q, k.transpose(2,3)) / math.sqrt(head_dim)
         
         if attention_mask is not None:  # no matter the length, we just slice it
-            # import pdb; pdb.set_trace()
             causal_mask = attention_mask.data[:, :, :, : k.shape[-2]]
             attn_weights = attn_weights + causal_mask
                 
@@ -648,8 +651,8 @@ class TorchDevice:
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
         # (s, b * n_head, head_dim)
-        k = k.reshape(b*n_head, s, head_dim).permute(2, 0, 1)
-        v = v.reshape(b*n_head, head_dim, s).permute(1, 0, 2)
+        k = k.reshape(b*n_head, head_dim, s).permute(2, 0, 1)
+        v = v.reshape(b*n_head, s, head_dim).permute(1, 0, 2)
 
         if compress_cache:
             k = self.compressed_device.compress(k, comp_config)
@@ -657,7 +660,7 @@ class TorchDevice:
         else:
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
-
+        
         return TorchTensor.create_from_torch(value, self), k, v
 
     def gqa_gen(self, inputs, attention_mask, position_embeddings, attn_dropout, w_q, w_k, w_v, w_out, n_head, n_kv_head, k_cache, v_cache, donate,
@@ -675,17 +678,15 @@ class TorchDevice:
         head_dim = h // n_head
 
         hidden = inputs.data
-        import pdb; pdb.set_trace()
-
         # shape: (b, 1, h)
         q = F.linear(hidden, w_q.data)
         k = F.linear(hidden, w_k.data)
         v = F.linear(hidden, w_v.data)
         # shape: (b, 1, n_head, head_dim)
         
-        q = q.view(b, tgt_s, n_head, head_dim)
-        k = k.view(b, tgt_s, n_kv_head, head_dim)
-        v = v.view(b, tgt_s, n_kv_head, head_dim)
+        q = q.view(b, tgt_s, n_head, head_dim).transpose(1,2)
+        k = k.view(b, tgt_s, n_kv_head, head_dim).transpose(1,2)
+        v = v.view(b, tgt_s, n_kv_head, head_dim).transpose(1,2)
         
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q,k,cos,sin)
@@ -696,17 +697,13 @@ class TorchDevice:
             k = k.reshape(b, n_kv_head * num_grp, tgt_s, head_dim)
             v = v[:,:, None, :, :].expand(b, n_kv_head, num_grp, tgt_s, head_dim)
             v = v.reshape(b, n_kv_head * num_grp, tgt_s, head_dim)
-        
-        attn_weights = torch.matmul(q, k.transpose(2,3)) / math.sqrt(head_dim)
-        
-
-        # shape: (b * n_head, 1, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
+            
         # shape: (1, b * n_head, head_dim)
         k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
+
         # shape: (1, b * n_head, head_dim)
         v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-
+        
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
                 if compress_cache:
@@ -721,45 +718,43 @@ class TorchDevice:
                 v[src_s - 1:src_s] = v_new
 
                 # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
+                #k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
                 # shape: (b * n_head, s, head_dim)
-                v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
+                #v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
+                k = k.reshape(b, n_kv_head * num_grp, src_s, head_dim)
+                v = v.reshape(b, n_kv_head * num_grp, src_s, head_dim)
 
                 if k.is_cuda:
-                    value = self._attention_value(q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim)
+                    # value = self._attention_value(q, k, v, attention_mask.data,
+                    #     b, src_s, tgt_s, n_head, head_dim)
+                    q = q.to(k.dtype)
+                    attn_weights = torch.matmul(q,k.transpose(2,3)) / math.sqrt(head_dim)
+                    if attention_mask is not None:  # no matter the length, we just slice it
+                        # attention_mask.data.transpose(2,3)
+                        causal_mask = attention_mask.data.transpose(2,3)[:, :1 , :1, :k.shape[-2]].to(k.dtype)
+                        attn_weights = attn_weights + causal_mask
+                    
+                    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(inputs.dtype)
+                    attn_weights = F.dropout(attn_weights, p=attn_dropout, training=False)
+                    attn_output = torch.matmul(attn_weights, v.to(inputs.dtype))
+                    
+                    attn_output = attn_output.transpose(1, 2).contiguous()
+                    attn_output = attn_output.reshape(b, tgt_s, -1)
+                    
+                    value = F.linear(attn_output, w_out.data)
+
+                    value.add_(inputs.data)
                 else:
+                    import pdb; pdb.set_trace()
                     q = q.float().cpu()
                     k, v = k.float(), v.float()
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, n_head, head_dim).cuda().half()
-            else:  # Sparse attention
-                # shape: (s, b * n_head, head_dim)
-                k = k_cache.data[:src_s]
-                k[src_s - 1:src_s] = k_new
-                # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-
-                if k.is_cuda:
-                    value = self._sparse_attention_value(q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity)
-                else:
-                    q = q.float().cpu()
-                    value = self._sparse_attention_value(q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity).cuda().half()
         else:  # Mixed device attention
             assert attn_sparsity >= 1.0
             value = self._mixed_device_attention(q, k_cache, v_cache,
                 k_new, v_new, attention_mask.data, b, src_s, tgt_s,
                 n_head, head_dim)
-
-        # shape: (b, 1, h)
-        value = value.transpose(1, 2).view(b, tgt_s, h)
-        value = F.linear(value, w_out.data, bias=b_out.data)
-
-        value.add_(inputs.data)
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
@@ -902,9 +897,10 @@ class TorchDevice:
 
         b, s, h = inputs.shape
         out = inputs.data
-        out = F.linear(out, w_up.data)
-        F.relu(out, inplace=True)
-        out = F.linear(out, w_down.data)
+        gate_out = F.linear(out, w_gate.data)
+        up_out = F.linear(out, w_up.data)
+        intermediate_state = F.silu(gate_out*up_out, inplace=True)
+        out = F.linear(intermediate_state, w_down.data)
 
         out.add_(inputs.data)
         if donate[0]: inputs.delete()

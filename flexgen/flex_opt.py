@@ -113,13 +113,11 @@ def init_weight_list(weight_specs, policy, env):
             weight = home.allocate(shape, dtype, pin_memory=pin_memory)
 
             if DUMMY_WEIGHT not in filename:
-                import pdb; pdb.set_trace()
                 weight.load_from_np_file(weight_specs[i][2])
             else:
                 if type(dtype) != torch.dtype:
                     weight.load_from_np(np.ones(shape, dtype))
                 else:
-                    # import pdb; pdb.set_trace()
                     weight.load_from_torch(torch.ones(shape, dtype = dtype))
                 #weight.load_from_np(np.random.rand(*shape).astype(dtype))
         else:
@@ -251,10 +249,8 @@ class LlamaRotaryEmbedding:
         donate = [False] * 4
         h, donate[0] = hidden.val, True
 
-        try:
-            mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-        except:
-            import pdb; pdb.set_trace()
+
+        mask, donate[1] = attention_mask.val.smart_copy(self.compute)
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
@@ -737,7 +733,7 @@ class LlamaGroupedQueryAttention:
             pos = self.task.prompt_len + i
             indices = (slice(pos - k_new.shape[0], pos),
                        slice(0, k_new.shape[1]))
-
+        
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
 
@@ -781,7 +777,7 @@ class LlamaRMSNorm(torch.nn.Module):
         LlamaRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size, device=env.gpu.dev))
         self.variance_epsilon = eps
         
         self.config = config
@@ -1586,7 +1582,7 @@ class LlamaLM:
         self.num_gpu_batches = policy.num_gpu_batches
         self.position_embeddings = [[0, 0] for i in range(self.num_gpu_batches)]
         
-        self.causal_mask = torch.full((config.max_seq_len,config.max_seq_len), fill_value = 1)
+        self.causal_mask = torch.full((config.max_seq_len,config.max_seq_len), fill_value = 1, device=env.gpu.dev)
 
         layers = []
         layers.append(LlamaRotaryEmbedding(self.config, self.env, self.policy))
@@ -1761,7 +1757,6 @@ class LlamaLM:
         if j == self.num_layers - 1:  # store to output
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
-            #import pdb; pdb.set_trace()
             ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
             pos = self.task.prompt_len + i
             if self.task.stop:
@@ -1828,8 +1823,6 @@ class LlamaLM:
         causal_mask = torch.triu(causal_mask, diagonal=1)
         causal_mask *= torch.arange(self.task.prompt_len, device=attention_compute.dev) > cache_position.reshape(-1, 1)
         causal_mask = causal_mask[None, None, :, :].expand(gpu_batch_size, 1, -1, -1)
-        
-        # import pdb; pdb.set_trace()
         
         val.load_from_torch(causal_mask)
         self.attention_mask[k].store(val)
@@ -2225,6 +2218,7 @@ def run_flexgen(args):
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
     
     model = None
+    opt_config = None
     if args.model.lower() == "meta-llama/meta-llama-3-70b":
         llama_config = get_llama_config(args.model)
         cache_size = llama_config.cache_bytes(num_prompts, prompt_len + gen_len)
@@ -2302,8 +2296,14 @@ def run_flexgen(args):
     else:
         filename = args.log_file
 
-    log_str = write_benchmark_log(filename,
-        opt_config.model_bytes(), cache_size, hidden_size,
+    if opt_config != None:
+        log_str = write_benchmark_log(filename,
+            opt_config.model_bytes(), cache_size, hidden_size,
+            gpu_peak_mem, projected, prefill_latency, prefill_throughput,
+            decode_latency, decode_throughput, total_latency, total_throughput)
+    else:
+        log_str = write_benchmark_log(filename,
+        llama_config.model_bytes(), cache_size, hidden_size,
         gpu_peak_mem, projected, prefill_latency, prefill_throughput,
         decode_latency, decode_throughput, total_latency, total_throughput)
     if args.verbose >= 1:
