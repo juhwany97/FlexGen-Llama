@@ -72,7 +72,7 @@ def get_llama_config(name, **kwargs):
         )
     elif arch_name == "meta-llama-3-70b":
         config = LlamaConfig(name=name,
-            num_hidden_layers=80, max_seq_len=8192, hidden_size=8192, n_head=64, n_kv_head=8,
+            num_hidden_layers=80, max_seq_len=2048, hidden_size=8192, n_head=64, n_kv_head=8,
             input_dim=8192, ffn_embed_dim=28672,
         )
     else:

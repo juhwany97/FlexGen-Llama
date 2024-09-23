@@ -1034,9 +1034,9 @@ class OptLM:
             raise NotImplementedError()
 
         # CUDA streams
-        self.load_weight_stream = torch.cuda.Stream()
-        self.load_cache_stream = torch.cuda.Stream()
-        self.store_cache_stream = torch.cuda.Stream()
+        self.load_weight_stream = torch.cuda.Stream(device=self.env.gpu.dev)
+        self.load_cache_stream = torch.cuda.Stream(device=self.env.gpu.dev)
+        self.store_cache_stream = torch.cuda.Stream(device=self.env.gpu.dev)
 
         # Intermediate tensors
         # The following buffers store values used
@@ -1588,9 +1588,7 @@ class LlamaLM:
         layers.append(LlamaRotaryEmbedding(self.config, self.env, self.policy))
         for i in range(self.config.num_hidden_layers):
             layers.append(LlamaGroupedQueryAttention(self.config, self.env, self.policy, i))
-            # layers.append(MLP(self.config, self.env, self.policy, i))
             layers.append(Llama3wayMLP(self.config, self.env, self.policy, i))
-            #layers.append(TransformerLayer(self.config, self.env, self.policy, i))
         layers.append(LlamaLMHead(self.config, self.env, self.policy))
         self.layers = layers
         self.num_layers = len(layers)
@@ -1605,9 +1603,9 @@ class LlamaLM:
             raise NotImplementedError()
 
         # CUDA streams
-        self.load_weight_stream = torch.cuda.Stream()
-        self.load_cache_stream = torch.cuda.Stream()
-        self.store_cache_stream = torch.cuda.Stream()
+        self.load_weight_stream = torch.cuda.Stream(device=self.env.gpu.dev)
+        self.load_cache_stream = torch.cuda.Stream(device=self.env.gpu.dev)
+        self.store_cache_stream = torch.cuda.Stream(device=self.env.gpu.dev)
 
         # Intermediate tensors
         # The following buffers store values used
@@ -2229,7 +2227,7 @@ def run_flexgen(args):
 
         print("init weight...")
         model = LlamaLM(llama_config, env, args.path, policy)
-    if args.model.lower() == "meta-llama/meta-llama-3-8b":
+    elif args.model.lower() == "meta-llama/meta-llama-3-8b":
         llama_config = get_llama_config(args.model)
         cache_size = llama_config.cache_bytes(num_prompts, prompt_len + gen_len)
         hidden_size = llama_config.hidden_bytes(num_prompts, prompt_len + gen_len)
